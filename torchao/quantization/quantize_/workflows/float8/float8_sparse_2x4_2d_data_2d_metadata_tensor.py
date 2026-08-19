@@ -26,6 +26,7 @@ from torchao.quantization.quantize_.common import (
     _choose_quant_func_and_quantize_tensor,
 )
 from torchao.quantization.quantize_.workflows.float8.kernels import (
+    _rowwise_scaled_linear_sparse_cutedsl,
     _to_sparse_semi_structured_cutedsl,
 )
 from torchao.quantization.utils import get_block_size
@@ -89,6 +90,7 @@ class Float8Sparse2x4_2DData2DMetadataTensor(TorchAOBaseTensor):
     optional_tensor_attribute_names = [
         "block_size",
         "act_quant_kwargs",
+        "_sparse_kernel_choice",
         "dtype",
     ]
 
@@ -99,6 +101,7 @@ class Float8Sparse2x4_2DData2DMetadataTensor(TorchAOBaseTensor):
         scale: torch.Tensor,
         block_size: Optional[List[int]] = None,
         act_quant_kwargs: Optional[QuantizeTensorToFloat8Kwargs] = None,
+        _sparse_kernel_choice: SparseKernelChoice = SparseKernelChoice.CUTLASS,
         dtype: Optional[torch.dtype] = None,
     ):
         shape = qdata.shape[0], 2 * qdata.shape[1]
@@ -116,6 +119,7 @@ class Float8Sparse2x4_2DData2DMetadataTensor(TorchAOBaseTensor):
         scale: torch.Tensor,
         block_size: Optional[List[int]] = None,
         act_quant_kwargs: Optional[QuantizeTensorToFloat8Kwargs] = None,
+        _sparse_kernel_choice: SparseKernelChoice = SparseKernelChoice.CUTLASS,
         dtype: Optional[torch.dtype] = None,
     ):
         super().__init__()
@@ -124,6 +128,19 @@ class Float8Sparse2x4_2DData2DMetadataTensor(TorchAOBaseTensor):
         self.scale = scale
         self.block_size = block_size
         self.act_quant_kwargs = act_quant_kwargs
+        self._sparse_kernel_choice = _sparse_kernel_choice
+
+    @classmethod
+    def __tensor_unflatten__(
+        cls, tensor_data_dict, tensor_attributes, outer_size, outer_stride
+    ):
+        if "_sparse_kernel_choice" not in tensor_attributes:
+            tensor_attributes = tensor_attributes | {
+                "_sparse_kernel_choice": SparseKernelChoice.CUTLASS
+            }
+        return super().__tensor_unflatten__(
+            tensor_data_dict, tensor_attributes, outer_size, outer_stride
+        )
 
     def __repr__(self):
         return (
@@ -213,6 +230,7 @@ class Float8Sparse2x4_2DData2DMetadataTensor(TorchAOBaseTensor):
             scale,
             block_size=block_size,
             act_quant_kwargs=act_quant_kwargs,
+            _sparse_kernel_choice=sparse_backend,
             dtype=hp_dtype,
         )
 
@@ -248,9 +266,23 @@ def _(func, types, args, kwargs):
     weight_meta = weight_tensor.sparse_metadata
     weight_scale = weight_tensor.scale.squeeze(1)
     out_dtype = input_tensor.dtype
+    sparse_backend = weight_tensor._sparse_kernel_choice
 
-    out = rowwise_scaled_linear_sparse_cutlass_f8f8(
-        input, input_scale, weight, weight_meta, weight_scale, bias, out_dtype
+    if sparse_backend is SparseKernelChoice.CUTEDSL:
+        linear_op = _rowwise_scaled_linear_sparse_cutedsl
+    elif sparse_backend is SparseKernelChoice.CUTLASS:
+        linear_op = rowwise_scaled_linear_sparse_cutlass_f8f8
+    else:
+        raise ValueError(f"Unsupported sparse backend: {sparse_backend.value}")
+
+    out = linear_op(
+        input,
+        input_scale,
+        weight,
+        weight_meta,
+        weight_scale,
+        bias,
+        out_dtype,
     )
     return out
 
